@@ -8,8 +8,6 @@ http://web.archive.org/web/20210310084602/https://users.cs.jmu.edu/buchhofp/fore
 http://web.archive.org/web/20210225050454/https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
 """
 
-import bz2
-import lzma
 import mmap
 import struct
 import zlib
@@ -43,61 +41,64 @@ class ZipInfo:
         """Directories in a zip file should end with '/'."""
         return self.filename.endswith("/")
 
+def get_end_rec_data(filename):
+    from zipfile import ZipFile, _EndRecData, _ECD_SIGNATURE, _ECD_ENTRIES_TOTAL, _ECD_OFFSET, _ECD_COMMENT_SIZE 
+    zip = ZipFile(file=filename, mode='r')
 
-def _read_eocd_mmap(m: mmap.mmap) -> Dict[str, ZipInfo]:
+    endrec = _EndRecData(zip.fp)
+    signature, num_files, directory_offset, comment_length = endrec[_ECD_SIGNATURE], endrec[_ECD_ENTRIES_TOTAL], endrec[_ECD_OFFSET], endrec[_ECD_COMMENT_SIZE ]
+    return signature, num_files, directory_offset, comment_length
+
+def _read_eocd_mmap(m: mmap.mmap, filename:str) -> Dict[str, ZipInfo]:
     # Read end-of-central-directory (EOCD) from mmaped zipfile.
 
-    # TODO Can zip64 EOCDs be larger?
-    max_eocd_size = 22 + 65536
-    end = m[-max_eocd_size:]
+    # # TODO Can zip64 EOCDs be larger?
+    # max_eocd_size = 22 + 65536
+    # end = m[-max_eocd_size:]
 
-    # Scan backwards until EOCD signature is found
-    # TODO this could fail if a comment contains the EOCD signature.
-    # Should employ sanity check to verify that an actual EOCD was found.
-    offset32 = end.rfind(b"PK\5\6")
+    # # Scan backwards until EOCD signature is found
+    # # TODO this could fail if a comment contains the EOCD signature.
+    # # Should employ sanity check to verify that an actual EOCD was found.
+    # offset32 = end.rfind(b"\x50\x4b\x05\x06")
+    # assert offset32 >= 0
+    # eocd = struct.unpack("<IHHHHIIH", end[offset32 : offset32 + 22])
+    # (
+    #     signature,
+    #     num_disks,
+    #     num_disks2,
+    #     num_files,
+    #     num_files2,
+    #     directory_size,
+    #     directory_offset,
+    #     comment_length,
+    # ) = eocd
+    # assert signature == 0x06054B50
 
-    assert offset32 >= 0
+    # # If format is zip64, there should also be a zip64 EOCD header
+    # if directory_offset == 0xFFFFFFFF:
+    #     offset64 = end.rfind(b"\x50\x4b\x06\x06")
+    #     assert offset64 >= 0
+    #     eocd = struct.unpack("<IQHHII4Q", end[offset64 : offset64 + 56])
+    #     (
+    #         signature,
+    #         eocd_size,
+    #         version,
+    #         min_version,
+    #         num_disks,
+    #         num_disks2,
+    #         num_files,
+    #         num_files2,
+    #         directory_size,
+    #         directory_offset,
+    #     ) = eocd
+    #     assert signature == 0x06064B50
 
-    eocd = struct.unpack("<4sHHHHIIH", end[offset32 : offset32 + 22])
+    signature, num_files, directory_offset, comment_length = get_end_rec_data(filename)
+    
 
-    (
-        signature,
-        num_disks,
-        num_disks2,
-        num_files,
-        num_files2,
-        directory_size,
-        directory_offset,
-        comment_length,
-    ) = eocd
 
-    assert signature == b"PK\5\6"
-
-    # Read zip64 end of central directory if locator exists
-    locator_offset = end.rfind(b"PK\6\7")
-    if locator_offset != -1:
-        offset, = struct.unpack("<Q", end[locator_offset + 8: locator_offset + 16])
-        eocd64_data = m[offset: offset + 56]
-
-        eocd64 = struct.unpack("<4sQHHII4Q", eocd64_data)
-
-        (
-            eocd64_signature,
-            eocd_size,
-            version,
-            min_version,
-            num_disks,
-            num_disks2,
-            num_files,
-            num_files2,
-            directory_size,
-            directory_offset,
-        ) = eocd64
-
-        assert eocd64_signature == b"PK\6\6"
 
     # Read central directory headers which hold information about stored files
-    # as long as the signature matches
     files: Dict[str, ZipInfo] = {}
     mmap_offset = directory_offset
     for _ in range(num_files):
@@ -122,22 +123,15 @@ def _read_eocd_mmap(m: mmap.mmap) -> Dict[str, ZipInfo]:
             attributes0,
             attributes1,
             offset,
-        ) = struct.unpack("<4s6H3I5HII", header)
+        ) = struct.unpack("<I6H3I5HII", header)
 
-        assert signature == b"PK\1\2"
+        assert signature == 0x02014B50
 
         filename_bytes = m[mmap_offset : mmap_offset + filename_length]
         mmap_offset += filename_length
         extra = m[mmap_offset : mmap_offset + extra_length]
         mmap_offset += extra_length + comment_length
-        for encoding in ["utf-8", "windows-1252", "CP437"]:
-            try:
-                filename = filename_bytes.rstrip(b"\0").decode(encoding)
-                break
-            except UnicodeDecodeError:
-                pass
-        else:
-            raise ValueError(f"Could not decode filename " + str(filename_bytes))
+        filename = filename_bytes.rstrip(b"\0").decode("utf-8")
 
         # TODO Figure out what those bytes mean.
         # TODO Parse extra header correctly
@@ -196,7 +190,7 @@ class ParallelZipFile:
         m = mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ)
 
         if files is None:
-            files = _read_eocd_mmap(m)
+            files = _read_eocd_mmap(m, file)
 
         self.filename: str = file
         self.files = files
@@ -277,18 +271,6 @@ class ParallelZipFile:
             # DEFLATE compression
             decompress = zlib.decompressobj(-zlib.MAX_WBITS)
             return decompress.decompress(compressed)
-        elif compression == 12:
-            return bz2.decompress(compressed)
-        elif compression == 14:
-            # LZMA compression
-            _, size = struct.unpack("<HH", compressed[:4])
-            assert len(compressed) >= 4 + size
-            filt = lzma._decode_filter_properties(lzma.FILTER_LZMA1, compressed[4:4 + size])
-            decompress = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=[filt])
-            decompressed = decompress.decompress(compressed[4 + size:])
-            # Decompresses too much data sometimes
-            decompressed = decompressed[:uncompressed_size]
-            return decompressed
         else:
             error_message = f"Compression method {compression} not implemented"
             raise NotImplementedError(error_message)
